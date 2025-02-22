@@ -1,75 +1,101 @@
 package test
 
 import (
-	"os"
-	"os/exec"
-	"testing"
-	"time"
-
-	"github.com/gruntwork-io/terratest/modules/azure"
-	"github.com/gruntwork-io/terratest/modules/logger"
-	"github.com/gruntwork-io/terratest/modules/terraform"
-	"github.com/stretchr/testify/assert"
+    "encoding/json"
+    "os"
+    "os/exec"
+    "testing"
+    "time"
+    "github.com/gruntwork-io/terratest/modules/logger"
+    "github.com/gruntwork-io/terratest/modules/terraform"
+    "github.com/stretchr/testify/assert"
 )
 
 var subscriptionID string = "f13ce856-164c-44af-a9ea-d8c5f46ac222"
 
 func TestAzureLinuxVMCreation(t *testing.T) {
-	logger.Log(t, "Current PATH before update: ", os.Getenv("PATH"))
-	os.Setenv("PATH", os.Getenv("PATH")+";C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin")
-	logger.Log(t, "Updated PATH: ", os.Getenv("PATH"))
+    logger.Log(t, "Current PATH before update: ", os.Getenv("PATH"))
+    os.Setenv("PATH", os.Getenv("PATH") + ";C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin")
+    logger.Log(t, "Updated PATH: ", os.Getenv("PATH"))
 
-	terraformOptions := &terraform.Options{
-		TerraformDir: "../",
-		Vars: map[string]interface{}{
-			"label_prefix": "zhou0265",
-		},
-		RetryableTerraformErrors: map[string]string{
-			"InternalServerError": "Retrying due to Azure internal server error",
-		},
-		MaxRetries:         3,
-		TimeBetweenRetries: 5 * time.Second,
-	}
+    terraformOptions := &terraform.Options{
+        TerraformDir: "../",
+        Vars: map[string]interface{}{
+            "label_prefix": "zhou0265",
+        },
+        RetryableTerraformErrors: map[string]string{
+            "InternalServerError": "Retrying due to Azure internal server error",
+            "NetworkSecurityGroupOldReferencesNotCleanedUp": "Retrying due to NSG reference cleanup delay",
+        },
+        MaxRetries:         5,
+        TimeBetweenRetries: 15 * time.Second,
+    }
 
-	defer terraform.Destroy(t, terraformOptions)
-	terraform.InitAndApply(t, terraformOptions)
+    defer func() {
+        logger.Log(t, "Waiting 60 seconds before destroy to ensure Azure settles...")
+        time.Sleep(60 * time.Second)
+        terraform.Destroy(t, terraformOptions)
+    }()
+    terraform.InitAndApply(t, terraformOptions)
 
-	resourceGroupName := terraform.Output(t, terraformOptions, "resource_group_name")
-	vmName := terraform.Output(t, terraformOptions, "vm_name")
-	nicName := terraform.Output(t, terraformOptions, "nic_name")
-	logger.Log(t, "Resource Group Name: ", resourceGroupName)
-	logger.Log(t, "VM Name: ", vmName)
-	logger.Log(t, "NIC Name: ", nicName)
+    resourceGroupName := terraform.Output(t, terraformOptions, "resource_group_name")
+    vmName := terraform.Output(t, terraformOptions, "vm_name")
+    nicName := terraform.Output(t, terraformOptions, "nic_name")
+    logger.Log(t, "Resource Group Name: ", resourceGroupName)
+    logger.Log(t, "VM Name: ", vmName)
+    logger.Log(t, "NIC Name: ", nicName)
 
-	// Wait for Azure to propagate the resource group
-	logger.Log(t, "Waiting 30 seconds for Azure to settle...")
-	time.Sleep(30 * time.Second)
+    logger.Log(t, "Waiting 30 seconds for Azure to settle...")
+    time.Sleep(30 * time.Second)
 
-	// Confirm VM exists with manual az call (with retry)
-	var output []byte
-	var err error
-	for i := 0; i < 3; i++ {
-		cmd := exec.Command("cmd", "/c", "az", "vm", "show", "--name", vmName, "--resource-group", resourceGroupName, "--subscription", subscriptionID)
-		output, err = cmd.CombinedOutput()
-		if err == nil {
-			break
-		}
-		logger.Log(t, "Attempt", i+1, "failed: ", err, string(output))
-		time.Sleep(10 * time.Second) // Wait before retry
-	}
-	if err != nil {
-		logger.Log(t, "Manual az vm show failed after retries: ", err, string(output))
-		t.Fatalf("VM check failed: %v", err)
-	} else {
-		logger.Log(t, "Manual az vm show succeeded: VM exists")
-	}
+    // Confirm VM exists
+    cmd := exec.Command("cmd", "/c", "az", "vm", "show", "--name", vmName, "--resource-group", resourceGroupName, "--subscription", subscriptionID)
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        logger.Log(t, "Manual az vm show failed: ", err, string(output))
+        t.Fatalf("VM check failed: %v", err)
+    }
+    logger.Log(t, "Manual az vm show succeeded: VM exists")
 
-	actualNicNames := azure.GetVirtualMachineNics(t, vmName, resourceGroupName, subscriptionID)
-	assert.Equal(t, nicName, actualNicNames[0])
+    // Confirm NIC exists and is connected to VM
+    cmd = exec.Command("cmd", "/c", "az", "vm", "nic", "list", "--vm-name", vmName, "--resource-group", resourceGroupName, "--subscription", subscriptionID)
+    output, err = cmd.CombinedOutput()
+    if err != nil {
+        logger.Log(t, "Manual az vm nic list failed: ", err, string(output))
+        t.Fatalf("NIC check failed: %v", err)
+    }
+    var nicList []map[string]interface{}
+    if err := json.Unmarshal(output, &nicList); err != nil {
+        logger.Log(t, "Failed to parse NIC list JSON: ", err, string(output))
+        t.Fatalf("NIC JSON parse failed: %v", err)
+    }
+    if len(nicList) == 0 {
+        t.Fatal("No NICs found for VM")
+    }
+    name, ok := nicList[0]["name"]
+    if !ok || name == nil {
+        logger.Log(t, "NIC list missing 'name' field: ", string(output))
+        t.Fatalf("NIC name is missing or nil in response")
+    }
+    actualNicName, ok := name.(string)
+    if !ok {
+        logger.Log(t, "NIC name is not a string: ", string(output))
+        t.Fatalf("NIC name is not a string: %v", name)
+    }
+    assert.Equal(t, nicName, actualNicName)
 
-	vmImage := azure.GetVirtualMachineImage(t, vmName, resourceGroupName, subscriptionID)
-	expectedOSPublisher := "Canonical"
-	expectedOSVersion := "22_04-lts-gen2"
-	assert.Equal(t, expectedOSPublisher, vmImage.Publisher)
-	assert.Equal(t, expectedOSVersion, vmImage.SKU)
+    // Confirm VM image
+    cmd = exec.Command("cmd", "/c", "az", "vm", "get-instance-view", "--name", vmName, "--resource-group", resourceGroupName, "--subscription", subscriptionID, "--query", "storageProfile.imageReference")
+    output, err = cmd.CombinedOutput()
+    if err != nil {
+        logger.Log(t, "Manual az vm image check failed: ", err, string(output))
+        t.Fatalf("Image check failed: %v", err)
+    }
+    var image map[string]string
+    if err := json.Unmarshal(output, &image); err != nil {
+        logger.Log(t, "Failed to parse image JSON: ", err, string(output))
+        t.Fatalf("Image JSON parse failed: %v", err)
+    }
+    assert.Equal(t, "Canonical", image["publisher"])
+    assert.Equal(t, "22_04-lts-gen2", image["sku"])
 }
